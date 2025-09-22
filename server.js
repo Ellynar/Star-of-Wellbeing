@@ -230,8 +230,8 @@ app.post('/submit', authMiddleware, async (req, res) => {
       data // Assessment choices
     } = req.body;
 
-    // Validate required fields
-    if (!fullName || !email || !birthday || !barangay || !data) {
+    // Validate required fields (allow legacy users without barangay to submit)
+    if (!fullName || !email || !birthday || !data) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
     const years = calculateAgeInYears(birthday);
@@ -253,7 +253,7 @@ app.post('/submit', authMiddleware, async (req, res) => {
         fullName,
         email,
         birthday: new Date(birthday),
-        barangay,
+        barangay: barangay || '',
         cityMunicipality: cityMunicipality || '',
         province: province || '',
         region: region || '',
@@ -269,14 +269,15 @@ app.post('/submit', authMiddleware, async (req, res) => {
       user.fullName = fullName;
       user.email = email;
       user.birthday = new Date(birthday);
-      user.barangay = barangay;
-      user.cityMunicipality = cityMunicipality || '';
-      user.province = province || '';
-      user.region = region || '';
-      user.barangayCode = barangayCode || '';
-      user.cityCode = cityCode || '';
-      user.provinceCode = provinceCode || '';
-      user.regionCode = regionCode || '';
+      // Only overwrite location fields if provided (keeps legacy users working)
+      if (barangay) user.barangay = barangay;
+      if (cityMunicipality) user.cityMunicipality = cityMunicipality;
+      if (province) user.province = province;
+      if (region) user.region = region;
+      if (barangayCode) user.barangayCode = barangayCode;
+      if (cityCode) user.cityCode = cityCode;
+      if (provinceCode) user.provinceCode = provinceCode;
+      if (regionCode) user.regionCode = regionCode;
       user.consentGiven = !!consentGiven;
     }
 
