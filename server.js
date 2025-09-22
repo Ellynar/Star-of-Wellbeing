@@ -26,17 +26,24 @@ const __dirname = path.dirname(__filename);
 // MongoDB Connection — switch between Railway env and local by commenting
 // const MONGO = 'mongodb://localhost:27017/star_assessment'; // Local
 const MONGO = process.env.MONGODB_URI || 'mongodb://localhost:27017/star_assessment'; // Online/Env
-mongoose.connect(MONGO, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-});
+mongoose
+  .connect(MONGO)
+  .then(() => console.log('MongoDB connected'))
+  .catch((err) => console.error('MongoDB connection error:', err.message));
 
 // User Schema
 const UserSchema = new mongoose.Schema({
   fullName: { type: String, required: true },
   email: { type: String, required: true, unique: true },
-  age: { type: Number, required: true },
-  address: { type: String, required: true },
+  birthday: { type: Date, required: true },
+  barangay: { type: String, required: true },
+  cityMunicipality: { type: String },
+  province: { type: String },
+  region: { type: String },
+  barangayCode: { type: String },
+  cityCode: { type: String },
+  provinceCode: { type: String },
+  regionCode: { type: String },
   consentGiven: { type: Boolean, default: false },
   uid: { type: String, required: true, unique: true },
   passwordHash: { type: String, required: true },
@@ -76,17 +83,33 @@ function authMiddleware(req, res, next) {
   }
 }
 
+function calculateAgeInYears(birthdayInput) {
+  const date = new Date(birthdayInput);
+  if (isNaN(date.getTime())) return NaN;
+  const now = new Date();
+  let years = now.getFullYear() - date.getFullYear();
+  const m = now.getMonth() - date.getMonth();
+  if (m < 0 || (m === 0 && now.getDate() < date.getDate())) {
+    years--;
+  }
+  return years;
+}
+
 // Auth routes
 app.post('/auth/register', async (req, res) => {
   try {
-    const { fullName, email, password, password2, age, address, consentGiven } = req.body;
-    if (!fullName || !email || !password || !age || !address) {
+    const { fullName, email, password, password2, birthday, barangay, cityMunicipality, province, region, barangayCode, cityCode, provinceCode, regionCode, consentGiven } = req.body;
+    if (!fullName || !email || !password || !birthday || !barangay) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
     if (password2 !== undefined && password !== password2) {
       return res.status(400).json({ error: 'Passwords do not match' });
     }
-    if (Number(age) < 10) {
+    const years = calculateAgeInYears(birthday);
+    if (!isFinite(years)) {
+      return res.status(400).json({ error: 'Invalid birthday' });
+    }
+    if (years < 10) {
       return res.status(400).json({ error: 'Minimum age is 10' });
     }
     const existing = await User.findOne({ email });
@@ -96,8 +119,15 @@ app.post('/auth/register', async (req, res) => {
     const user = await User.create({
       fullName,
       email,
-      age,
-      address,
+      birthday: new Date(birthday),
+      barangay,
+      cityMunicipality: cityMunicipality || '',
+      province: province || '',
+      region: region || '',
+      barangayCode: barangayCode || '',
+      cityCode: cityCode || '',
+      provinceCode: provinceCode || '',
+      regionCode: regionCode || '',
       consentGiven: !!consentGiven,
       uid,
       passwordHash
@@ -106,6 +136,44 @@ app.post('/auth/register', async (req, res) => {
     return res.status(201).json({ ok: true, token, uid: user.uid });
   } catch (e) {
     return res.status(500).json({ error: 'Registration failed', details: e.message });
+  }
+});
+
+// PSGC proxy: provinces (for top-level select)
+app.get('/psgc/provinces', async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim();
+    const urls = [
+      `https://psgc-api.wareneutron.com/api/provinces?${q ? `name=${encodeURIComponent(q)}&` : ''}per_page=200`,
+      `https://psgc.cloud/api/provinces?${q ? `q=${encodeURIComponent(q)}&` : ''}per_page=200`
+    ];
+    async function fetchAll(url) {
+      try {
+        const r = await fetch(url);
+        if (!r.ok) return [];
+        const j = await r.json();
+        const arr = Array.isArray(j?.data) ? j.data : (Array.isArray(j) ? j : []);
+        return arr.map(it => ({
+          name: it?.name || it?.province_name || '',
+          code: it?.code || it?.psgc_code || it?.province_code || '',
+          region: it?.region_name || it?.region || '',
+          regionCode: it?.region_code || it?.regionCode || ''
+        }));
+      } catch { return []; }
+    }
+    const merged = (await Promise.all(urls.map(fetchAll))).flat();
+    const seen = new Set();
+    const dedup = merged.filter(x => { const k = `${x.name}|${x.region}`.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return !!x.name; });
+    const ql = q.toLowerCase();
+    const ranked = dedup.sort((a,b) => {
+      const ap = (a.name||'').toLowerCase().startsWith(ql) ? 0 : 1;
+      const bp = (b.name||'').toLowerCase().startsWith(ql) ? 0 : 1;
+      if (ap !== bp) return ap - bp; return (a.name||'').localeCompare(b.name||'');
+    }).slice(0, 100);
+    return res.json({ ok: true, suggestions: ranked });
+  } catch (e) {
+    console.error('PSGC provinces proxy error:', e);
+    return res.status(500).json({ error: 'Failed to fetch provinces' });
   }
 });
 
@@ -149,17 +217,28 @@ app.post('/submit', authMiddleware, async (req, res) => {
     const { 
       fullName, 
       email, 
-      age, 
-      address, 
+      birthday, 
+      barangay, 
+      cityMunicipality,
+      province,
+      region,
+      barangayCode,
+      cityCode,
+      provinceCode,
+      regionCode,
       consentGiven,
       data // Assessment choices
     } = req.body;
 
     // Validate required fields
-    if (!fullName || !email || !age || !address || !data) {
+    if (!fullName || !email || !birthday || !barangay || !data) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
-    if (Number(age) < 10) {
+    const years = calculateAgeInYears(birthday);
+    if (!isFinite(years)) {
+      return res.status(400).json({ error: 'Invalid birthday' });
+    }
+    if (years < 10) {
       return res.status(400).json({ error: 'Minimum age is 10' });
     }
 
@@ -173,8 +252,15 @@ app.post('/submit', authMiddleware, async (req, res) => {
       user = new User({
         fullName,
         email,
-        age,
-        address,
+        birthday: new Date(birthday),
+        barangay,
+        cityMunicipality: cityMunicipality || '',
+        province: province || '',
+        region: region || '',
+        barangayCode: barangayCode || '',
+        cityCode: cityCode || '',
+        provinceCode: provinceCode || '',
+        regionCode: regionCode || '',
         consentGiven: !!consentGiven,
         uid: userUid,
         passwordHash: (await bcrypt.hash(uuidv4(), 10)) // placeholder if somehow missing
@@ -182,8 +268,15 @@ app.post('/submit', authMiddleware, async (req, res) => {
     } else {
       user.fullName = fullName;
       user.email = email;
-      user.age = age;
-      user.address = address;
+      user.birthday = new Date(birthday);
+      user.barangay = barangay;
+      user.cityMunicipality = cityMunicipality || '';
+      user.province = province || '';
+      user.region = region || '';
+      user.barangayCode = barangayCode || '';
+      user.cityCode = cityCode || '';
+      user.provinceCode = provinceCode || '';
+      user.regionCode = regionCode || '';
       user.consentGiven = !!consentGiven;
     }
 
@@ -251,6 +344,97 @@ app.get('/assessments', async (req, res) => {
   }
 });
 
+// PSGC proxy for barangay suggestions
+app.get('/psgc/barangays', async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim();
+    const cityCodeFilter = String(req.query.cityCode || '').trim();
+    const provinceCodeFilter = String(req.query.provinceCode || '').trim();
+    // Allow: q-only, city-only, province-only
+    if (!q && !cityCodeFilter && !provinceCodeFilter) return res.json({ ok: true, suggestions: [] });
+
+    const norm = (s) => String(s || '')
+      .toLowerCase()
+      .normalize('NFD').replace(/\p{Diacritic}/gu, '')
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const qNorm = norm(q);
+
+    async function fetchProvider(url) {
+      try {
+        const r = await fetch(url);
+        if (!r.ok) return [];
+        const j = await r.json();
+        const arr = Array.isArray(j?.data) ? j.data : Array.isArray(j?.value) ? j.value : (Array.isArray(j) ? j : []);
+        return arr.map(it => ({
+          name: it?.name || it?.brgy_name || '',
+          code: it?.code || it?.psgc_code || it?.brgy_code || '',
+          cityMunicipality: it?.city_municipality_name || it?.cityMunicipality || it?.city_name || it?.municipality_name || '',
+          city_code: it?.city_code || it?.cityMunicipalityCode || it?.city_municipality_code || '',
+          province: it?.province_name || it?.province || '',
+          province_code: it?.province_code || it?.provinceCode || '',
+          region: it?.region_name || it?.region || ''
+        }));
+      } catch { return []; }
+    }
+
+    let providers = [];
+    if (cityCodeFilter) {
+      // Fetch barangays for a specific city only (most accurate)
+      const city = encodeURIComponent(String(cityCodeFilter).replace(/\D/g,''));
+      providers = [
+        `https://psgc-api.wareneutron.com/api/cities-municipalities/${city}/barangays?per_page=2000`,
+        `https://psgc.cloud/api/cities-municipalities/${city}/barangays?per_page=2000`
+      ];
+    } else if (provinceCodeFilter) {
+      // Province-wide barangays (can be large)
+      const prov = encodeURIComponent(String(provinceCodeFilter).replace(/\D/g,''));
+      providers = [
+        `https://psgc-api.wareneutron.com/api/provinces/${prov}/barangays?per_page=4000`,
+        `https://psgc.cloud/api/provinces/${prov}/barangays?per_page=4000`
+      ];
+    } else if (q) {
+      // Fallback global search
+      providers = [
+        `https://psgc-api.wareneutron.com/api/barangays?name=${encodeURIComponent(q)}&per_page=1000`,
+        `https://psgc.cloud/api/barangays?q=${encodeURIComponent(q)}&per_page=1000`
+      ];
+    }
+
+    const resultsArrays = await Promise.all(providers.map(fetchProvider));
+    let merged = ([]).concat(...resultsArrays);
+
+    // When using nested endpoints, filtering is not required; keep merged as-is
+
+    // Dedupe and optionally rank by query
+    const seen = new Set();
+    let deduped = merged.filter(it => {
+      const key = `${it.name}|${it.cityMunicipality}|${it.province}`.toLowerCase();
+      if (seen.has(key)) return false; seen.add(key); return !!it.name;
+    });
+
+    deduped = deduped.sort((a,b) => (a.name||'').localeCompare(b.name||''));
+
+    if (q) {
+      function isPrefix(t, qn){ return t.startsWith(qn); }
+      function isSubstring(t, qn){ return t.includes(qn); }
+      const ranked = deduped
+        .map(it => { const t = norm(it.name); const s = isPrefix(t,qNorm)?0:isSubstring(t,qNorm)?1:2; return {it,s}; })
+        .sort((a,b)=> a.s - b.s || a.it.name.localeCompare(b.it.name))
+        .slice(0, 1000)
+        .map(x=>x.it);
+      return res.json({ ok: true, suggestions: ranked });
+    }
+
+    return res.json({ ok: true, suggestions: deduped.slice(0,4000) });
+  } catch (e) {
+    console.error('PSGC proxy error:', e);
+    return res.status(500).json({ error: 'Failed to fetch barangay suggestions' });
+  }
+});
+
 app.get('/generate-pdf', async (req, res) => {
   try {
     const { name = 'Anonymous', data = '{}' } = req.query;
@@ -269,8 +453,117 @@ app.get('/generate-pdf', async (req, res) => {
   }
 });
 
-// Port — Railway provides PORT, comment/uncomment for local override if needed
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`Backend running on http://localhost:${PORT}`));
+// PSGC proxy: cities/municipalities search
+app.get('/psgc/cities', async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim();
+    const provinceCodeFilter = String(req.query.provinceCode || '').trim();
+    if (!q && !provinceCodeFilter) return res.json({ ok: true, suggestions: [] });
+    const urls = [
+      `https://psgc-api.wareneutron.com/api/cities-municipalities?${q ? `name=${encodeURIComponent(q)}&` : ''}per_page=500`,
+      `https://psgc.cloud/api/cities-municipalities?${q ? `q=${encodeURIComponent(q)}&` : ''}per_page=500`
+    ];
+    // Provider-specific endpoints when provinceCode is known
+    if (provinceCodeFilter) {
+      const raw = String(provinceCodeFilter || '').replace(/\D/g, '');
+      const trimmed = raw.replace(/0+$/,'');
+      const short4 = trimmed.slice(0, 4);
+      const candidates = Array.from(new Set([raw, trimmed, short4].filter(Boolean)));
+      const pc = encodeURIComponent(raw);
+      urls.push(
+        `https://psgc-api.wareneutron.com/api/provinces/${pc}/cities-municipalities?per_page=500`,
+        `https://psgc.cloud/api/provinces/${pc}/cities-municipalities?per_page=500`
+      );
+      // Also try with trimmed/short candidates
+      for (const c of candidates) {
+        const enc = encodeURIComponent(c);
+        urls.push(
+          `https://psgc-api.wareneutron.com/api/provinces/${enc}/cities-municipalities?per_page=500`,
+          `https://psgc.cloud/api/provinces/${enc}/cities-municipalities?per_page=500`
+        );
+      }
+    }
+    async function fetchAll(url) {
+      try {
+        const r = await fetch(url);
+        if (!r.ok) return [];
+        const j = await r.json();
+        // Normalize both provider shapes { data: [...] } and { value: [...] }
+        const arr = Array.isArray(j?.data) ? j.data : Array.isArray(j?.value) ? j.value : (Array.isArray(j) ? j : []);
+        return arr.map(it => ({
+          name: it?.name || it?.city_name || it?.municipality_name || '',
+          code: it?.code || it?.psgc_code || it?.city_code || it?.municipality_code || '',
+          province: it?.province_name || it?.province || '',
+          provinceCode: it?.province_code || it?.provinceCode || it?.prov_code || it?.provCode || '',
+          region: it?.region_name || it?.region || '',
+          regionCode: it?.region_code || it?.regionCode || ''
+        }));
+      } catch { return []; }
+    }
+    let results = (await Promise.all(urls.map(fetchAll))).flat();
+    if (provinceCodeFilter) {
+      const onlyDigits = (v) => String(v || '').replace(/\D/g, '');
+      const trimTailZeros = (v) => onlyDigits(v).replace(/0+$/, '');
+      const provRaw = onlyDigits(provinceCodeFilter);
+      const provTrim = trimTailZeros(provRaw);
+      const provPrefix4 = provTrim.slice(0, 4);
+
+      // If provider didn't include province codes, fall back to prefix match on city code
+      results = results.filter(x => {
+        const cityCodeRaw = onlyDigits(x.code);
+        const cityTrim = trimTailZeros(cityCodeRaw);
+        const cityPrefix4 = cityTrim.slice(0, 4);
+        const candProv = trimTailZeros(x.provinceCode || x.province_code);
+        return (
+          (candProv && (candProv === provTrim || candProv.slice(0,4) === provPrefix4)) ||
+          (!candProv && cityPrefix4 === provPrefix4)
+        );
+      });
+    }
+    const seen = new Set();
+    const dedup = results.filter(x => {
+      const key = `${x.name}|${x.province}`.toLowerCase();
+      if (seen.has(key)) return false; seen.add(key); return !!x.name;
+    });
+    const ql = q.toLowerCase();
+    // If filtering by province without a text query, return full sorted list (for dropdown)
+    if (provinceCodeFilter && !q) {
+      const full = dedup.sort((a,b) => (a.name||'').localeCompare(b.name||''));
+      return res.json({ ok: true, suggestions: full });
+    }
+    const ranked = dedup
+      .map(it => ({ it, p: (it.name||'').toLowerCase().startsWith(ql) ? 0 : 1 }))
+      .sort((a,b) => a.p - b.p || a.it.name.localeCompare(b.it.name))
+      .slice(0, 8)
+      .map(x => x.it);
+    return res.json({ ok: true, suggestions: ranked });
+  } catch (e) {
+    console.error('PSGC cities proxy error:', e);
+    return res.status(500).json({ error: 'Failed to fetch city suggestions' });
+  }
+});
+
+// Port — prefers env PORT. If in use locally, gracefully try the next ports
+const BASE_PORT = parseInt(process.env.PORT || '8080', 10);
+
+function startServer(port, attempt = 0) {
+  const server = app.listen(port, () => {
+    const actualPort = server.address().port;
+    console.log(`Backend running on http://localhost:${actualPort}`);
+  });
+
+  server.on('error', (err) => {
+    if (err && err.code === 'EADDRINUSE' && !process.env.PORT && attempt < 10) {
+      const nextPort = port + 1;
+      console.warn(`Port ${port} in use, trying ${nextPort}...`);
+      startServer(nextPort, attempt + 1);
+    } else {
+      console.error('Failed to start server:', err);
+      process.exit(1);
+    }
+  });
+}
+
+startServer(BASE_PORT);
 
 
