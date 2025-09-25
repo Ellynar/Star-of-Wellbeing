@@ -31,12 +31,12 @@ mongoose
   .then(() => console.log('MongoDB connected'))
   .catch((err) => console.error('MongoDB connection error:', err.message));
 
-// User Schema
+// User Schema — only email + password are required; rest optional
 const UserSchema = new mongoose.Schema({
-  fullName: { type: String, required: true },
+  fullName: { type: String },
   email: { type: String, required: true, unique: true },
-  birthday: { type: Date, required: true },
-  barangay: { type: String, required: true },
+  birthday: { type: Date },
+  barangay: { type: String },
   cityMunicipality: { type: String },
   province: { type: String },
   region: { type: String },
@@ -98,40 +98,15 @@ function calculateAgeInYears(birthdayInput) {
 // Auth routes
 app.post('/auth/register', async (req, res) => {
   try {
-    const { fullName, email, password, password2, birthday, barangay, cityMunicipality, province, region, barangayCode, cityCode, provinceCode, regionCode, consentGiven } = req.body;
-    if (!fullName || !email || !password || !birthday || !barangay) {
-      return res.status(400).json({ error: 'Missing required fields' });
-    }
-    if (password2 !== undefined && password !== password2) {
-      return res.status(400).json({ error: 'Passwords do not match' });
-    }
-    const years = calculateAgeInYears(birthday);
-    if (!isFinite(years)) {
-      return res.status(400).json({ error: 'Invalid birthday' });
-    }
-    if (years < 10) {
-      return res.status(400).json({ error: 'Minimum age is 10' });
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
     }
     const existing = await User.findOne({ email });
     if (existing) return res.status(409).json({ error: 'Email already registered' });
     const uid = uuidv4();
     const passwordHash = await bcrypt.hash(String(password), 10);
-    const user = await User.create({
-      fullName,
-      email,
-      birthday: new Date(birthday),
-      barangay,
-      cityMunicipality: cityMunicipality || '',
-      province: province || '',
-      region: region || '',
-      barangayCode: barangayCode || '',
-      cityCode: cityCode || '',
-      provinceCode: provinceCode || '',
-      regionCode: regionCode || '',
-      consentGiven: !!consentGiven,
-      uid,
-      passwordHash
-    });
+    const user = await User.create({ email, uid, passwordHash });
     const token = signToken({ uid: user.uid, email: user.email, id: user._id });
     return res.status(201).json({ ok: true, token, uid: user.uid });
   } catch (e) {
@@ -214,33 +189,8 @@ app.use(async (req, res, next) => {
 // Submission endpoint (protected)
 app.post('/submit', authMiddleware, async (req, res) => {
   try {
-    const { 
-      fullName, 
-      email, 
-      birthday, 
-      barangay, 
-      cityMunicipality,
-      province,
-      region,
-      barangayCode,
-      cityCode,
-      provinceCode,
-      regionCode,
-      consentGiven,
-      data // Assessment choices
-    } = req.body;
-
-    // Validate required fields
-    if (!fullName || !email || !birthday || !barangay || !data) {
-      return res.status(400).json({ error: 'Missing required fields' });
-    }
-    const years = calculateAgeInYears(birthday);
-    if (!isFinite(years)) {
-      return res.status(400).json({ error: 'Invalid birthday' });
-    }
-    if (years < 10) {
-      return res.status(400).json({ error: 'Minimum age is 10' });
-    }
+    const { data, ...optionalProfile } = req.body; // Assessment choices and any optional profile
+    if (!data) { return res.status(400).json({ error: 'Missing assessment data' }); }
 
     // Use auth user uid for link; still allow update of basics
     const userUid = req.user?.uid || uuidv4();
@@ -249,36 +199,10 @@ app.post('/submit', authMiddleware, async (req, res) => {
     // Ensure user exists or update basics
     let user = await User.findOne({ uid: userUid });
     if (!user) {
-      user = new User({
-        fullName,
-        email,
-        birthday: new Date(birthday),
-        barangay,
-        cityMunicipality: cityMunicipality || '',
-        province: province || '',
-        region: region || '',
-        barangayCode: barangayCode || '',
-        cityCode: cityCode || '',
-        provinceCode: provinceCode || '',
-        regionCode: regionCode || '',
-        consentGiven: !!consentGiven,
-        uid: userUid,
-        passwordHash: (await bcrypt.hash(uuidv4(), 10)) // placeholder if somehow missing
-      });
-    } else {
-      user.fullName = fullName;
-      user.email = email;
-      user.birthday = new Date(birthday);
-      user.barangay = barangay;
-      user.cityMunicipality = cityMunicipality || '';
-      user.province = province || '';
-      user.region = region || '';
-      user.barangayCode = barangayCode || '';
-      user.cityCode = cityCode || '';
-      user.provinceCode = provinceCode || '';
-      user.regionCode = regionCode || '';
-      user.consentGiven = !!consentGiven;
+      user = new User({ uid: userUid, email: optionalProfile.email || '', passwordHash: (await bcrypt.hash(uuidv4(), 10)) });
     }
+    // Optionally update profile fields if sent
+    Object.assign(user, optionalProfile);
 
     // Determine next sequence for this user
     const lastAssessment = await Assessment.findOne({ user_parent_uid: userUid }).sort({ sequenceNumber: -1 }).lean();
@@ -324,7 +248,7 @@ app.get('/users/:uid/assessments', authMiddleware, async (req, res) => {
   }
 });
 
-app.get('/users', async (req, res) => {
+app.get('/users', authMiddleware, async (req, res) => {
   try {
     const users = await User.find({});
     return res.status(200).json(users);
@@ -334,7 +258,7 @@ app.get('/users', async (req, res) => {
   }
 });
 
-app.get('/assessments', async (req, res) => {
+app.get('/assessments', authMiddleware, async (req, res) => {
   try {
     const assessments = await Assessment.find({});
     return res.status(200).json(assessments);
